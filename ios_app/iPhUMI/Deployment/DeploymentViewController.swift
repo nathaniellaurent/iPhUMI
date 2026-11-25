@@ -80,7 +80,16 @@ class DeploymentViewController: UIViewController, AVCaptureVideoDataOutputSample
     @IBOutlet weak var wideView: UIView!
     var lidarImageView: UIImageView!
     
-    let captureSession = AVCaptureMultiCamSession()
+    // Multi-cam session (main + ultrawide) by default. Replaced in viewDidLoad by a plain AVCaptureSession when the
+    // "Main only" setting is on, so that multi-cam format limits and hardware cost do not apply.
+    var captureSession: AVCaptureSession = AVCaptureMultiCamSession()
+
+    // "Cameras" setting as stored in UserDefaults (deployMainCameraOnly)
+    var mainCameraOnlySetting: Bool = false
+    // Mode this screen actually runs in: follows the session type chosen in viewDidLoad, so it cannot change while the session is alive
+    var mainCameraOnly: Bool {
+        return !(captureSession is AVCaptureMultiCamSession)
+    }
     
     // Define inputs
     var lidarCamera: AVCaptureDevice?
@@ -143,6 +152,9 @@ class DeploymentViewController: UIViewController, AVCaptureVideoDataOutputSample
     var lastUltrawideTime: CMTime? = nil
     var lastWideTime: CMTime? = nil
     var lastDepthTime: CMTime? = nil
+
+    // Capture failure shown in the main camera's FPS label instead of the FPS / "CAMERA NOT UPDATING" (main thread only)
+    var wideCameraErrorText: String? = nil
     
     // Socket status
     @IBOutlet weak var ultrawideSocketStatusLabel: UILabel!
@@ -157,6 +169,13 @@ class DeploymentViewController: UIViewController, AVCaptureVideoDataOutputSample
         UIApplication.shared.isIdleTimerDisabled = true
 
         applySettingsFromDefaults()
+
+        // "Main only": capture just the main camera with a plain session (must be created before the session is configured in viewDidAppear)
+        if mainCameraOnlySetting {
+            let session = AVCaptureSession()
+            session.sessionPreset = .inputPriority // formats are set on the device directly (the multi-cam session always works this way)
+            captureSession = session
+        }
         
         // Create UIImageView for LiDAR depth data
         if previewEnabled && depthEnabled {
@@ -189,6 +208,15 @@ class DeploymentViewController: UIViewController, AVCaptureVideoDataOutputSample
             ultrawideMainLabel.textColor = .systemRed
         }
 
+        if mainCameraOnly {
+            // ultrawide is not captured in this mode: say so and hide its preview / status labels
+            ultrawideMainLabel.text = "Ultrawide off (Main only)"
+            ultrawideMainLabel.textColor = .secondaryLabel
+            ultrawideView.isHidden = true
+            ultrawideFPSCoutner.isHidden = true
+            ultrawideSocketStatusLabel.isHidden = true
+        }
+
         socketTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in
            if self.getConnectionType() == .Ethernet {
                self.validateEthernetSocketConnection()
@@ -210,7 +238,7 @@ class DeploymentViewController: UIViewController, AVCaptureVideoDataOutputSample
             if let lastWideTime = self.lastWideTime {
                 let delta = uptime - CMTimeGetSeconds(lastWideTime)
                 if delta > 1 { // 1 second has past since last frame
-                    self.wideFPSCounter.text = "CAMERA NOT UPDATING"
+                    self.wideFPSCounter.text = self.wideCameraErrorText ?? "CAMERA NOT UPDATING"
                 }
             }
             
@@ -238,6 +266,11 @@ class DeploymentViewController: UIViewController, AVCaptureVideoDataOutputSample
     override func viewDidAppear(_ animated: Bool) {
         applySettingsFromDefaults()
         connectToCurrentSource()
+
+        // make capture session failures visible (otherwise the stream just silently has no frames)
+        NotificationCenter.default.addObserver(self, selector: #selector(captureSessionRuntimeError(_:)), name: AVCaptureSession.runtimeErrorNotification, object: captureSession)
+        NotificationCenter.default.addObserver(self, selector: #selector(captureSessionWasInterrupted(_:)), name: AVCaptureSession.wasInterruptedNotification, object: captureSession)
+
         configureCaptureSession()
     }
 
@@ -246,6 +279,8 @@ class DeploymentViewController: UIViewController, AVCaptureVideoDataOutputSample
         socketTimer?.invalidate()
         socketTimer = nil
         disconnectFromAllSources()
+        NotificationCenter.default.removeObserver(self, name: AVCaptureSession.runtimeErrorNotification, object: captureSession)
+        NotificationCenter.default.removeObserver(self, name: AVCaptureSession.wasInterruptedNotification, object: captureSession)
         if captureSession.isRunning {
             captureSession.stopRunning()
         }
@@ -276,6 +311,14 @@ class DeploymentViewController: UIViewController, AVCaptureVideoDataOutputSample
         } else {
             ultrawideAutofocusEnabled = false
             defaults.set(false, forKey: "deployUltrawideAutofocus")
+        }
+
+        // Cameras (false: main + ultrawide, true: main only)
+        if let deployMainCameraOnly = defaults.object(forKey: "deployMainCameraOnly") as? Bool {
+            mainCameraOnlySetting = deployMainCameraOnly
+        } else {
+            mainCameraOnlySetting = false
+            defaults.set(mainCameraOnlySetting, forKey: "deployMainCameraOnly")
         }
         
         // Connection type (0: USB, 1: Ethernet)
@@ -331,15 +374,17 @@ class DeploymentViewController: UIViewController, AVCaptureVideoDataOutputSample
     private func configureCaptureSession() {
         captureSession.beginConfiguration()
 
-        guard AVCaptureMultiCamSession.isMultiCamSupported else {
+        guard mainCameraOnly || AVCaptureMultiCamSession.isMultiCamSupported else { // "Main only" uses a plain session, so it does not need multi-cam support
             print("Multi-camera capture is not supported on this device.")
+            showWideCameraError("MULTI-CAM NOT SUPPORTED")
             return
         }
 
         // Update resolution/FPS configuration based on persisted settings
         applySettingsFromDefaults()
 
-        var deviceTypes: [AVCaptureDevice.DeviceType] = [.builtInUltraWideCamera]
+        // "Main only": the ultrawide is not discovered, so ultraWideCamera stays nil and its input/output/preview setup below is skipped
+        var deviceTypes: [AVCaptureDevice.DeviceType] = mainCameraOnly ? [] : [.builtInUltraWideCamera]
         if depthEnabled {
             deviceTypes.append(.builtInLiDARDepthCamera) // includes wide angle as part of depth
         } else {
@@ -436,16 +481,23 @@ class DeploymentViewController: UIViewController, AVCaptureVideoDataOutputSample
                 
                 // set resolution and frame rate
                 try wideDevice.lockForConfiguration()
-                if let format = wideDevice.formats.first(where: { format in
-                    if !format.isMultiCamSupported || format.isVideoHDRSupported { // for some bizarre reason I found that the formats that support HDR do not have auto focus working... (likely this is just a correlation, but adding condition to skip formats that have HDR enabled me to ensure the auto focus system still works...
-                        return false
-                    }
-                    let dimensions = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
-                    let supportedFrameRates = format.videoSupportedFrameRateRanges
-                    
-                    let valid = dimensions.width == captureResolutionWidth && dimensions.height == captureResolutionHeight && supportedFrameRates.contains { $0.maxFrameRate >= cameraFPS }
-                    return valid
-                }) {
+                let wideFormat: AVCaptureDevice.Format?
+                if mainCameraOnly {
+                    // plain session: the format does not need to support multi-cam (this may lower cameraFPS to 30)
+                    wideFormat = mainCameraOnlyFormat(for: wideDevice)
+                } else {
+                    wideFormat = wideDevice.formats.first(where: { format in
+                        if !format.isMultiCamSupported || format.isVideoHDRSupported { // for some bizarre reason I found that the formats that support HDR do not have auto focus working... (likely this is just a correlation, but adding condition to skip formats that have HDR enabled me to ensure the auto focus system still works...
+                            return false
+                        }
+                        let dimensions = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
+                        let supportedFrameRates = format.videoSupportedFrameRateRanges
+                        
+                        let valid = dimensions.width == captureResolutionWidth && dimensions.height == captureResolutionHeight && supportedFrameRates.contains { $0.maxFrameRate >= cameraFPS }
+                        return valid
+                    })
+                }
+                if let format = wideFormat {
                     wideDevice.activeFormat = format
                     let fpsTimescale = CMTimeScale(cameraFPS)
                     wideDevice.activeVideoMinFrameDuration = CMTime(value: 1, timescale: fpsTimescale)
@@ -459,7 +511,11 @@ class DeploymentViewController: UIViewController, AVCaptureVideoDataOutputSample
                     assert(wideDevice.isFocusModeSupported(.continuousAutoFocus))
                     wideDevice.focusMode = .continuousAutoFocus
                 } else {
-                    assert(false)
+                    // no matching format: the device keeps its current format, so make that visible in the main camera's label
+                    showWideCameraError("NO \(captureResolutionWidth)x\(captureResolutionHeight) FORMAT")
+                    if !mainCameraOnly {
+                        assert(false)
+                    }
                 }
                 wideDevice.unlockForConfiguration()
 
@@ -497,6 +553,77 @@ class DeploymentViewController: UIViewController, AVCaptureVideoDataOutputSample
             captureSession.startRunning()
         } catch {
             print("Error configuring capture session: \(error)")
+            showWideCameraError("CONFIG ERROR: \(error.localizedDescription)")
+        }
+    }
+
+    /// "Main only" mode: pick the main camera's format for a plain AVCaptureSession, i.e. without requiring multi-cam support.
+    /// Tries, in order: formats without HDR support at cameraFPS (same preference as the multi-cam path), HDR-capable formats at cameraFPS,
+    /// then the same two at 30 fps if 60 fps is not available. Sets cameraFPS to the frame rate that was actually found.
+    private func mainCameraOnlyFormat(for device: AVCaptureDevice) -> AVCaptureDevice.Format? {
+        var fpsCandidates: [Float64] = [cameraFPS]
+        if cameraFPS > 30 {
+            fpsCandidates.append(30)
+        }
+        for fps in fpsCandidates {
+            for allowHDR in [false, true] {
+                if let format = device.formats.first(where: { format in
+                    if format.isVideoHDRSupported && !allowHDR { // see comment for wide camera in configureCaptureSession for why formats with HDR are avoided
+                        return false
+                    }
+                    // only 8-bit 4:2:0 (what the multi-cam formats deliver); without multi-cam the list also has 10-bit formats, which would change the streamed images
+                    let pixelFormat = CMFormatDescriptionGetMediaSubType(format.formatDescription)
+                    if pixelFormat != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange && pixelFormat != kCVPixelFormatType_420YpCbCr8BiPlanarFullRange {
+                        return false
+                    }
+                    if depthEnabled && format.supportedDepthDataFormats.isEmpty { // depth output needs a format that delivers depth
+                        return false
+                    }
+                    let dimensions = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
+                    let supportedFrameRates = format.videoSupportedFrameRateRanges
+                    let frameRateSupported = supportedFrameRates.contains { $0.minFrameRate <= fps && $0.maxFrameRate >= fps }
+
+                    return dimensions.width == captureResolutionWidth && dimensions.height == captureResolutionHeight && frameRateSupported
+                }) {
+                    print("Main only: using format \(format) at \(fps) fps (requested \(cameraFPS) fps)")
+                    cameraFPS = fps
+                    return format
+                }
+            }
+        }
+        return nil
+    }
+
+    // MARK: - Capture session failures
+
+    /// Shows a capture failure in the main camera's FPS label and keeps it there (see wideCameraErrorText). Call on the main thread.
+    private func showWideCameraError(_ message: String) {
+        print("Capture error: \(message)")
+        wideCameraErrorText = message
+        wideFPSCounter.text = message
+    }
+
+    @objc private func captureSessionRuntimeError(_ notification: Notification) {
+        // e.g. the session could not start or stopped (can be posted on any thread)
+        let error = notification.userInfo?[AVCaptureSessionErrorKey] as? NSError
+        print("Capture session runtime error: \(String(describing: error))")
+        var message = "SESSION ERROR"
+        if let error = error {
+            message += " \(error.code): \(error.localizedDescription)"
+        }
+        DispatchQueue.main.async {
+            self.showWideCameraError(message)
+        }
+    }
+
+    @objc private func captureSessionWasInterrupted(_ notification: Notification) {
+        // reason is the raw value of AVCaptureSession.InterruptionReason (e.g. 1: app in background, 3: camera in use by another app, 5: system pressure such as overheating)
+        let reason = (notification.userInfo?[AVCaptureSessionInterruptionReasonKey] as? Int) ?? 0
+        print("Capture session interrupted (reason \(reason))")
+        DispatchQueue.main.async {
+            // not kept: the label goes back to the FPS as soon as frames arrive again
+            self.lastWideTime = nil // otherwise the 1-second timer replaces this message with "CAMERA NOT UPDATING"
+            self.wideFPSCounter.text = "INTERRUPTED (reason \(reason))"
         }
     }
     
@@ -585,7 +712,7 @@ class DeploymentViewController: UIViewController, AVCaptureVideoDataOutputSample
                 let resolutionDescription = streamingResolutionDescription()
 
                 DispatchQueue.main.async {
-                    self.wideFPSCounter.text = resolutionDescription + " @ " + fps
+                    self.wideFPSCounter.text = self.wideCameraErrorText ?? (resolutionDescription + " @ " + fps)
                     switch self.getConnectionType() {
                     case .USB:
                         self.wideSocketStatusLabel.text = "USB: " + (self.wideUSBManager.isConnected() ? "connected" : "disconnected")

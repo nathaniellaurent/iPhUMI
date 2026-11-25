@@ -13,16 +13,15 @@ from iphumi.demonstration_processing.utils.generic_util import (
     validate_tracking_artifacts,
     write_demonstration_metadata,
 )
-from iphumi.demonstration_processing.utils.interpolation_util import get_interp1d
+from iphumi.demonstration_processing.utils.interpolation_util import PoseInterpolator
 
 
 def _sample_poses_at_times(poses: np.ndarray, pose_times, sample_times: np.ndarray) -> np.ndarray:
+    # Rotation vectors flip sign near a 180-degree rotation, so interpolating their components one by one
+    # produces a wrong orientation for the frame in between. Slerp the rotation instead (PoseInterpolator).
     pose_6d = pose_4x4_to_6d(poses)
-    sampled_pose_6d = np.stack(
-        [get_interp1d(pose_times, pose_6d[:, dim])(sample_times) for dim in range(pose_6d.shape[1])],
-        axis=-1,
-    )
-    return pose_6d_to_4x4(sampled_pose_6d)
+    interp = PoseInterpolator(np.asarray(pose_times, dtype=np.float64), pose_6d)
+    return pose_6d_to_4x4(interp(sample_times))
 
 
 def _compute_frame_indices(time_strings: list, sample_times: np.ndarray, filter_empty: bool = False) -> np.ndarray:

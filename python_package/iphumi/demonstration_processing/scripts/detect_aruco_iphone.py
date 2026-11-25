@@ -76,6 +76,9 @@ def detect_localize_aruco_tags_iphone(
         K: np.ndarray,
         refine_subpix: bool=True):
     param = cv2.aruco.DetectorParameters()
+    # OpenCV drops tags with a corner within 3 px of the image border (its default). On the FastUMI mount the
+    # finger tags sit 1-3 px from the bottom edge of the 640x480 ultrawide frame, so keep them.
+    param.minDistanceToBorder = 0
     if refine_subpix:
         param.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
     detector = cv2.aruco.ArucoDetector(dictionary=aruco_dict, detectorParams=param)

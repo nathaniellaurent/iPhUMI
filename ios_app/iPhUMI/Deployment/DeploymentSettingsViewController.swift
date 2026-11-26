@@ -32,7 +32,7 @@ class DeploymentSettingsViewController: UITableViewController {
     }
 
     private enum ConnectionRow: Int, CaseIterable { case connectionType, ethernetHostIP, iphoneEthernetIP }
-    private enum CameraRow: Int, CaseIterable { case cameras, resolution, fps, autofocus, lensPosition, resetLensPosition }
+    private enum CameraRow: Int, CaseIterable { case captureSource, cameras, resolution, fps, autofocus, lensPosition, resetLensPosition }
     private enum DepthRow: Int, CaseIterable { case depthCapture, clippingDistance }
     private enum InterfaceRow: Int, CaseIterable { case preview }
 
@@ -40,6 +40,7 @@ class DeploymentSettingsViewController: UITableViewController {
     private var resolutionIndex: Int = 0
     private var fpsIndex: Int = 1
     private var mainCameraOnly: Bool = false
+    private var captureSourceARKit: Bool = false
     private var autofocusEnabled: Bool = false
     private var previewEnabled: Bool = true
     private var depthEnabled: Bool = false
@@ -81,6 +82,7 @@ class DeploymentSettingsViewController: UITableViewController {
         resolutionIndex = (defaults.object(forKey: "deployStreamResolutionIndex") as? Int) ?? 0
         fpsIndex = (defaults.object(forKey: "deployCameraFPSIndex") as? Int) ?? 1
         mainCameraOnly = (defaults.object(forKey: "deployMainCameraOnly") as? Bool) ?? false
+        captureSourceARKit = (defaults.object(forKey: "deployCaptureSourceARKit") as? Bool) ?? false
         autofocusEnabled = (defaults.object(forKey: "deployUltrawideAutofocus") as? Bool) ?? false
         previewEnabled = (defaults.object(forKey: "deployEnablePreview") as? Bool) ?? true
         depthEnabled = (defaults.object(forKey: "deployEnableDepth") as? Bool) ?? false
@@ -156,6 +158,13 @@ class DeploymentSettingsViewController: UITableViewController {
 
         case .camera:
             switch CameraRow(rawValue: indexPath.row)! {
+            case .captureSource:
+                // "ARKit": main-camera image and sceneDepth from an ARSession, as in the recordings (the Cameras setting is then ignored)
+                let cell = tableView.dequeueReusableCell(withIdentifier: "segmented", for: indexPath) as! SegmentedControlCell
+                cell.configure(label: "Capture Source", segments: ["Camera", "ARKit"],
+                               selectedIndex: captureSourceARKit ? 1 : 0,
+                               target: self, action: #selector(captureSourceChanged(_:)))
+                return cell
             case .cameras:
                 let cell = tableView.dequeueReusableCell(withIdentifier: "segmented", for: indexPath) as! SegmentedControlCell
                 cell.configure(label: "Cameras", segments: ["Main + Ultrawide", "Main only"],
@@ -283,6 +292,11 @@ class DeploymentSettingsViewController: UITableViewController {
     @objc private func connectionTypeChanged(_ sender: UISegmentedControl) {
         connectionTypeIndex = sender.selectedSegmentIndex
         UserDefaults.standard.set(connectionTypeIndex, forKey: "deployConnectionTypeIndex")
+    }
+
+    @objc private func captureSourceChanged(_ sender: UISegmentedControl) {
+        captureSourceARKit = (sender.selectedSegmentIndex == 1)
+        UserDefaults.standard.set(captureSourceARKit, forKey: "deployCaptureSourceARKit")
     }
 
     @objc private func camerasChanged(_ sender: UISegmentedControl) {

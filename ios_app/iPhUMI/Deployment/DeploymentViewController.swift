@@ -90,6 +90,11 @@ class DeploymentViewController: UIViewController, AVCaptureVideoDataOutputSample
     var mainCameraOnly: Bool {
         return !(captureSession is AVCaptureMultiCamSession)
     }
+
+    // "Capture Source" setting as stored in UserDefaults (deployCaptureSourceARKit)
+    var captureSourceARKitSetting: Bool = false
+    // Set in viewDidLoad when this screen captures from ARKit instead of the AVFoundation session above
+    var arkitStreamer: ARKitStreamer?
     
     // Define inputs
     var lidarCamera: AVCaptureDevice?
@@ -176,7 +181,13 @@ class DeploymentViewController: UIViewController, AVCaptureVideoDataOutputSample
             session.sessionPreset = .inputPriority // formats are set on the device directly (the multi-cam session always works this way)
             captureSession = session
         }
-        
+
+        // "ARKit": color image and sceneDepth come from an ARSession, as in the recordings; the AVFoundation session is not used
+        if captureSourceARKitSetting && ARKitStreamer.isSupported {
+            captureSession = AVCaptureSession() // never configured; a plain session makes the ultrawide UI below hide as in "Main only"
+            setUpARKitStreamer()
+        }
+
         // Create UIImageView for LiDAR depth data
         if previewEnabled && depthEnabled {
             lidarImageView = UIImageView(frame: lidarView.bounds)
@@ -215,6 +226,9 @@ class DeploymentViewController: UIViewController, AVCaptureVideoDataOutputSample
             ultrawideView.isHidden = true
             ultrawideFPSCoutner.isHidden = true
             ultrawideSocketStatusLabel.isHidden = true
+        }
+        if arkitStreamer != nil {
+            ultrawideMainLabel.text = "Ultrawide off (ARKit)"
         }
 
         socketTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in
@@ -267,6 +281,11 @@ class DeploymentViewController: UIViewController, AVCaptureVideoDataOutputSample
         applySettingsFromDefaults()
         connectToCurrentSource()
 
+        if let arkitStreamer {
+            arkitStreamer.start()
+            return
+        }
+
         // make capture session failures visible (otherwise the stream just silently has no frames)
         NotificationCenter.default.addObserver(self, selector: #selector(captureSessionRuntimeError(_:)), name: AVCaptureSession.runtimeErrorNotification, object: captureSession)
         NotificationCenter.default.addObserver(self, selector: #selector(captureSessionWasInterrupted(_:)), name: AVCaptureSession.wasInterruptedNotification, object: captureSession)
@@ -279,6 +298,7 @@ class DeploymentViewController: UIViewController, AVCaptureVideoDataOutputSample
         socketTimer?.invalidate()
         socketTimer = nil
         disconnectFromAllSources()
+        arkitStreamer?.pause()
         NotificationCenter.default.removeObserver(self, name: AVCaptureSession.runtimeErrorNotification, object: captureSession)
         NotificationCenter.default.removeObserver(self, name: AVCaptureSession.wasInterruptedNotification, object: captureSession)
         if captureSession.isRunning {
@@ -319,6 +339,14 @@ class DeploymentViewController: UIViewController, AVCaptureVideoDataOutputSample
         } else {
             mainCameraOnlySetting = false
             defaults.set(mainCameraOnlySetting, forKey: "deployMainCameraOnly")
+        }
+
+        // Capture source (false: camera via AVFoundation, true: ARKit)
+        if let deployCaptureSourceARKit = defaults.object(forKey: "deployCaptureSourceARKit") as? Bool {
+            captureSourceARKitSetting = deployCaptureSourceARKit
+        } else {
+            captureSourceARKitSetting = false
+            defaults.set(captureSourceARKitSetting, forKey: "deployCaptureSourceARKit")
         }
         
         // Connection type (0: USB, 1: Ethernet)
@@ -851,8 +879,76 @@ class DeploymentViewController: UIViewController, AVCaptureVideoDataOutputSample
     private func connectToUSB() {
         wideUSBManager.connect()
         ultrawideUSBManager.connect()
-        if depthEnabled {
+        if depthEnabled || arkitStreamer != nil { // ARKit sends its frame info (intrinsics, pose, timestamp) on the depth port even without depth
             depthUSBManager.connect()
+        }
+    }
+
+    // MARK: - ARKit capture
+
+    private func setUpARKitStreamer() {
+        let streamWidth = Int(Float(captureResolutionWidth) * cameraResizeScale)
+        let streamer = ARKitStreamer(depthEnabled: depthEnabled, streamWidth: streamWidth, targetFPS: cameraFPS)
+        streamer.send = { [weak self] jpeg, frameInfo, depthMap, sent in
+            guard let self else { return }
+            switch self.getConnectionType() {
+            case .USB:
+                // image first, then the frame info of the same ARFrame, so a reader can pair them by arrival order
+                if self.wideUSBManager.isConnected() {
+                    self.wideUSBManager.sendData(data: jpeg)
+                }
+                if self.depthUSBManager.isConnected() {
+                    self.depthUSBManager.sendData(data: frameInfo)
+                }
+            case .Ethernet:
+                // same messages as the camera path (no frame info over Ethernet)
+                if self.mainSocketClient.isConnected(), let image = CIImage(data: jpeg) {
+                    self.mainSocketClient.sendData(RgbSocketPacket(rgb: image).toEncodedString(), channel: "rgb")
+                }
+                if self.depthEnabled, self.depthSocketClient.isConnected(), let depthMap {
+                    self.depthSocketClient.sendData(DepthSocketPacket(depth: depthMap).toEncodedString(), channel: "depth")
+                }
+            }
+            DispatchQueue.main.async {
+                self.showARKitFrame(sent)
+            }
+        }
+        streamer.onError = { [weak self] message in
+            self?.showWideCameraError(message)
+        }
+        arkitStreamer = streamer
+    }
+
+    /// Updates the FPS / status labels for a frame sent from ARKit. Main thread.
+    private func showARKitFrame(_ sent: ARKitStreamer.SentFrame) {
+        let time = CMTime(seconds: sent.timestamp, preferredTimescale: 1_000_000_000) // ARKit timestamps use the CACurrentMediaTime clock, as the stall check in the timer expects
+        var fps = ""
+        if let lastWideTime {
+            fps = String(format: "%.2f", 1.0 / CMTimeGetSeconds(time - lastWideTime)) + " FPS"
+        }
+        lastWideTime = time
+        wideCameraErrorText = nil
+        let tracking = sent.trackingState == 2 ? "" : (sent.trackingState == 1 ? " LIMITED TRACKING" : " NO TRACKING")
+        wideFPSCounter.text = "\(sent.streamWidth)x\(sent.streamHeight) @ \(fps) (ARKit)\(tracking)"
+        if depthEnabled {
+            if sent.depthWidth > 0 {
+                depthFPSCounter.text = "\(sent.depthWidth)x\(sent.depthHeight) @ \(fps) (sceneDepth)"
+                lastDepthTime = time
+            } else {
+                depthFPSCounter.text = "NO SCENE DEPTH YET"
+            }
+        }
+        switch getConnectionType() {
+        case .USB:
+            wideSocketStatusLabel.text = "USB: " + (wideUSBManager.isConnected() ? "connected" : "disconnected")
+            if depthEnabled {
+                depthSocketStatusLabel.text = "USB: " + (depthUSBManager.isConnected() ? "connected" : "disconnected")
+            }
+        case .Ethernet:
+            wideSocketStatusLabel.text = "Ethernet: " + mainSocketClient.getStatus()
+            if depthEnabled {
+                depthSocketStatusLabel.text = "Ethernet: " + depthSocketClient.getStatus()
+            }
         }
     }
 

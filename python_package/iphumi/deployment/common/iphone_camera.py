@@ -39,6 +39,7 @@ from flask import Flask
 from flask_socketio import SocketIO
 
 from iphumi.common.cv_util import get_image_transform_with_border
+from iphumi.deployment.common.arkit_frame_info import is_frame_info, parse_frame_info
 from iphumi.deployment.common.qr_code_util import read_qr_code
 import pypeertalk
 
@@ -318,6 +319,8 @@ def _decode_usb_message(
     is_depth: bool,
 ) -> np.ndarray | None:
     if is_depth:
+        if is_frame_info(data):  # Capture Source "ARKit": sceneDepth with its own size inside a frame info message
+            return parse_frame_info(data).depth
         depth_array = np.frombuffer(data, dtype=np.float32)
         try:
             return depth_array.reshape(_DEPTH_SHAPE)
